@@ -1,0 +1,125 @@
+# =============================================================================
+# Pure Live — Windows 构建（免证书 / 无需任何 Secret）
+# -----------------------------------------------------------------------------
+# 与上游 release.yml 的区别：
+#   - 不依赖 CERTIFICATE / KEYSTORE 等任何密钥
+#   - 直接 flutter build windows，产出「便携 zip」（已内嵌 VC++ 运行库，解压即跑）
+#   - 额外打包一个「自签名 msix」作为安装包备用（安装前需信任该自签名证书）
+# 触发方式：
+#   1. 推送到 master/main 分支自动构建
+#   2. 在 GitHub 仓库 Actions 页面手动 Run workflow
+# 产物：在 Actions 运行结果的 Artifacts 中下载
+# =============================================================================
+
+name: Build Windows (No-Cert)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 签出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Flutter 3.38.5（Dart 3.10.4，满足 pubspec 约束）
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.5'
+          channel: 'stable'
+          cache: true
+
+      - name: 启用 Windows 桌面支持
+        run: flutter config --enable-windows-desktop
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 生成代码（json_serializable / drift，若仓库未提交生成文件则必需）
+        continue-on-error: true
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 编译 Windows Release
+        run: flutter build windows --release
+
+      - name: 将 VC++ 运行库打入 Release（让便携包自包含，免去目标机装 VC++ 2022 可再发行包）
+        shell: pwsh
+        run: |
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+          $ed  = Get-ChildItem $vsRoot -Directory | Select-Object -First 1
+          if (-not $ed) { Write-Warning "未找到 Visual Studio，跳过 VC++ 运行库打包"; exit 0 }
+          $base = "$vsRoot\$($ed.Name)\VC\Redist\MSVC"
+          $ver  = Get-ChildItem $base -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $crt  = "$base\$($ver.Name)\x64\Microsoft.VC143.CRT"
+          if (Test-Path $crt) {
+            Copy-Item "$crt\*" "build\windows\x64\runner\Release" -Force
+            Write-Host "已从 $crt 复制 VC++ 运行库"
+          } else {
+            Write-Warning "未找到 VC++ CRT ($crt)，便携包可能需要目标机安装 VC++ 2022 可再发行包"
+          }
+
+      - name: 读取版本号
+        id: version
+        shell: pwsh
+        run: |
+          foreach ($line in (Get-Content pubspec.yaml)) {
+            if ($line -match '^\s*version:\s*(\S+)') {
+              $v = $matches[1] -replace '["'"'"']', ''
+              "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Host "version=$v"
+              break
+            }
+          }
+
+      - name: 打包便携 zip
+        shell: pwsh
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          $ver = "${{ steps.version.outputs.version }}"
+          $zip = "PureLive-$ver-windows-x64-portable.zip"
+          Compress-Archive -Path "$rel\*" -DestinationPath $zip -Force
+          Write-Host "已生成 $zip"
+
+      - name: 生成自签名证书并打包 msix（备用，失败不阻断整体）
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $pw   = "pure_live_ci_$(Get-Random)"
+          $cert = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=pure_live" -CertStoreLocation "cert:\CurrentUser\My"
+          $pfx  = "ci_cert.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString -String $pw -Force -AsPlainText)
+          dart run msix:create --certificate $pfx --certificate-password $pw --signtool-options "/td SHA256"
+
+      - name: 收集 msix 产物
+        id: msix
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $m = Get-ChildItem "build\windows\x64\runner\Release" -Filter "*.msix" | Select-Object -First 1
+          if ($m) {
+            $dst = "PureLive-${{ steps.version.outputs.version }}-windows-x64.msix"
+            Copy-Item $m.FullName $dst -Force
+            "msix=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "msix=$dst"
+          } else {
+            Write-Host "未生成 msix（可忽略，便携 zip 仍可用）"
+          }
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: pure-live-windows
+          path: |
+            PureLive-*-windows-x64-portable.zip
+            PureLive-*-windows-x64.msix
+          if-no-files-found: warn
+          retention-days: 30
