@@ -31,10 +31,10 @@ jobs:
       - name: 签出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Flutter 3.38.5（Dart 3.10.4，满足 pubspec 约束）
+      - name: 设置 Flutter 3.47.0（Dart 3.13.0，满足 windows_single_instance 插件 >=3.11.0 的约束）
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.38.5'
+          flutter-version: '3.47.0'
           channel: 'stable'
           cache: true
 
